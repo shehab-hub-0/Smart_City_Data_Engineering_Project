@@ -1,0 +1,67 @@
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: 'Infrastructure Health'
+    folder: 'Infrastructure Alerts'
+    interval: 1m
+    rules:
+      # 1. Container Down Alert
+      - uid: container_down_id
+        title: '🛑 Container Down'
+        condition: A
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus-monitoring
+            model:
+              expr: 'up == 0'
+              refId: A
+        noDataState: Alerting
+        execErrState: Error
+        for: 1m
+        annotations:
+          summary: 'Service {{ $labels.job }} is Down!'
+          description: 'The container instance {{ $labels.instance }} has stopped responding. Immediate check required.'
+        labels:
+          severity: critical
+
+      # 2. High CPU Usage Alert
+      - uid: high_cpu_usage_id
+        title: '🔥 High CPU Usage'
+        condition: A
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus-monitoring
+            model:
+              expr: 'sum(irate(container_cpu_usage_seconds_total[5m])) by (name) * 100 > 85'
+              refId: A
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        annotations:
+          summary: 'High CPU Load on {{ $labels.name }}'
+          description: 'Container {{ $labels.name }} is consuming {{ $values.A.Value | printf "%.2f" }}% CPU for over 5 minutes.'
+        labels:
+          severity: warning
+
+      # 3. High Memory Usage Alert
+      - uid: high_memory_usage_id
+        title: '🧠 High Memory Usage'
+        condition: A
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus-monitoring
+            model:
+              expr: 'container_memory_usage_bytes / container_spec_memory_limit_bytes * 100 > 90'
+              refId: A
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        annotations:
+          summary: 'Memory Limit Near for {{ $labels.name }}'
+          description: 'Container {{ $labels.name }} is using {{ $values.A.Value | printf "%.2f" }}% of its allocated memory.'
+        labels:
+          severity: warning

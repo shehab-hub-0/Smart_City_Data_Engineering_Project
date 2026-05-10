@@ -1,0 +1,30 @@
+apiVersion: 1
+
+datasources:
+  # ── Dremio Flight SQL: Smart City Data Lakehouse (PRIMARY) ──
+  # Connects to the Gold Layer (Iceberg tables via Nessie catalog)
+  - name: Dremio-Lakehouse
+    type: influxdata-flightsql-datasource
+    uid: dremio-lakehouse
+    url: dremio:32010
+    isDefault: true
+    editable: true
+    jsonData:
+      host: dremio:32010
+      username: ${DREMIO_USER}
+      authType: username/password
+    secureJsonData:
+      password: ${DREMIO_PASSWORD}
+
+  # ── Prometheus: System Monitoring ────────────────────────────
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus-monitoring
+    url: http://prometheus:9090
+    access: proxy
+    isDefault: false
+    editable: true
+    jsonData:
+      timeInterval: 15s
+      queryTimeout: 60s
+      httpMethod: POST

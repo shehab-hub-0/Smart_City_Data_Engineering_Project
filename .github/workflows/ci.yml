@@ -1,0 +1,221 @@
+name: 🚀 Smart City CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "main", "develop" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # ══════════════════════════════════════════════════════════
+  # JOB 1 — Python Linting & Code Quality
+  # ══════════════════════════════════════════════════════════
+  python-lint:
+    name: 🐍 Python Linting & Quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 📦 Install Linting Tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8 flake8-bugbear flake8-docstrings
+
+      - name: 🔍 Run Flake8 on data/ directory
+        run: |
+          flake8 data/ \
+            --max-line-length=120 \
+            --ignore=E203,W503,D,F541,E402 \
+            --exclude=data/generator/__pycache__,data/outputs/__pycache__,data/producers/__pycache__,data/utils/__pycache__ \
+            --format="::error file=%(path)s,line=%(row)d,col=%(col)d::%(text)s" \
+            --count --statistics
+
+      - name: 🔍 Run Flake8 on dags/ directory
+        run: |
+          flake8 dags/ \
+            --max-line-length=120 \
+            --ignore=E203,W503,D,F541,E402 \
+            --format="::error file=%(path)s,line=%(row)d,col=%(col)d::%(text)s" \
+            --count --statistics
+        continue-on-error: true
+
+  # ══════════════════════════════════════════════════════════
+  # JOB 2 — Airflow DAG Validation
+  # ══════════════════════════════════════════════════════════
+  airflow-dag-validation:
+    name: 🌊 Airflow DAG Validation
+    runs-on: ubuntu-latest
+    needs: python-lint
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 📦 Install Apache Airflow (for DAG parsing)
+        run: |
+          pip install "apache-airflow==3.1.2" --constraint \
+            "https://raw.githubusercontent.com/apache/airflow/constraints-3.1.2/constraints-3.12.txt"
+
+      - name: ✅ Validate all DAGs can be parsed
+        run: |
+          echo "🔍 Checking DAG files for Python syntax errors..."
+          ERRORS=0
+          for dag_file in dags/*.py; do
+            echo -n "  Checking $dag_file ... "
+            if python -c "import ast; ast.parse(open('$dag_file').read())" 2>&1; then
+              echo "✅ OK"
+            else
+              echo "❌ FAILED"
+              ERRORS=$((ERRORS+1))
+            fi
+          done
+          if [ $ERRORS -gt 0 ]; then
+            echo "::error::$ERRORS DAG file(s) have syntax errors!"
+            exit 1
+          fi
+          echo ""
+          echo "✅ All DAG files passed syntax validation!"
+
+  # ══════════════════════════════════════════════════════════
+  # JOB 3 — Dockerfile Linting
+  # ══════════════════════════════════════════════════════════
+  dockerfile-lint:
+    name: 🐳 Dockerfile Best Practices
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔍 Lint Dockerfile.spark
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile.spark
+          failure-threshold: warning
+          ignore: DL3008,DL3009,DL3059,DL3013,DL3042,DL3015,DL3002
+
+      - name: 🔍 Lint Dockerfile.airflow
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile.airflow
+          failure-threshold: warning
+          ignore: DL3008,DL3009,DL3059,DL3013,DL3042,DL3015
+
+      - name: 🔍 Lint Dockerfile.notebook
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile.notebook
+          failure-threshold: warning
+          ignore: DL3008,DL3009,DL3059,DL3013,DL3042,DL3015
+
+  # ══════════════════════════════════════════════════════════
+  # JOB 4 — Docker Compose Validation
+  # ══════════════════════════════════════════════════════════
+  docker-compose-validation:
+    name: 🐙 Docker Compose Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 📝 Create dummy .env for validation
+        run: |
+          cat <<EOF > .env
+          PG_USER=postgres
+          PG_PASSWORD=postgres
+          PG_DB=postgres
+          AIRFLOW_UID=50000
+          AIRFLOW_PG_USER=airflow
+          AIRFLOW_PG_PASSWORD=airflow
+          AIRFLOW_PG_DB=airflow
+          AIRFLOW__CORE__FERNET_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx=
+          AIRFLOW__API_AUTH__JWT_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+          AIRFLOW__API_AUTH__JWT_ISSUER=airflow
+          MINIO_ROOT_USER=minioadmin
+          MINIO_ROOT_PASSWORD=minioadmin
+          GRAFANA_ADMIN_USER=admin
+          GRAFANA_ADMIN_PASSWORD=admin
+          PGADMIN_EMAIL=admin@test.com
+          PGADMIN_PASSWORD=admin
+          EOF
+
+      - name: ✅ Validate docker-compose.yml syntax
+        run: |
+          docker compose config --quiet
+          echo "✅ docker-compose.yml is valid!"
+
+  # ══════════════════════════════════════════════════════════
+  # JOB 5 — YAML & Config Files Validation
+  # ══════════════════════════════════════════════════════════
+  config-validation:
+    name: ⚙️ Config Files Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 📦 Install PyYAML
+        run: pip install pyyaml
+
+      - name: ✅ Validate all YAML config files
+        run: |
+          echo "🔍 Validating YAML config files..."
+          python -c "
+          import yaml, glob, sys
+          errors = 0
+          files = glob.glob('config/**/*.yml', recursive=True) + glob.glob('config/**/*.yaml', recursive=True)
+          for f in files:
+              try:
+                  yaml.safe_load(open(f))
+                  print(f'  ✅ {f}')
+              except yaml.YAMLError as e:
+                  print(f'  ❌ {f}: {e}')
+                  errors += 1
+          if errors:
+              sys.exit(1)
+          print(f'\n✅ All {len(files)} YAML files are valid!')
+          "
+
+  # ══════════════════════════════════════════════════════════
+  # JOB 6 — Summary Badge (runs after all jobs)
+  # ══════════════════════════════════════════════════════════
+  ci-success:
+    name: ✅ CI Pipeline Passed
+    runs-on: ubuntu-latest
+    needs:
+      - python-lint
+      - airflow-dag-validation
+      - dockerfile-lint
+      - docker-compose-validation
+      - config-validation
+    if: success()
+    steps:
+      - name: 🎉 All checks passed!
+        run: |
+          echo "╔══════════════════════════════════════╗"
+          echo "║  ✅ Smart City CI Pipeline: PASSED   ║"
+          echo "╠══════════════════════════════════════╣"
+          echo "║  🐍 Python Linting     → ✅ PASSED   ║"
+          echo "║  🌊 Airflow DAGs       → ✅ PASSED   ║"
+          echo "║  🐳 Dockerfile Lint    → ✅ PASSED   ║"
+          echo "║  🐙 Docker Compose     → ✅ PASSED   ║"
+          echo "║  ⚙️  Config YAML       → ✅ PASSED   ║"
+          echo "╚══════════════════════════════════════╝"

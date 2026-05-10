@@ -1,0 +1,589 @@
+# ================================================================
+# Smart City Data Engineering Platform
+# docker-compose.yml
+# ================================================================
+
+networks:
+  data-platform-net:
+    driver: bridge
+    name: data-platform-net
+    ipam:
+      config:
+        - subnet: 172.29.0.0/16
+
+# ── YAML Anchors ─────────────────────────────────────────────
+x-restart-policy: &restart-policy
+  restart: unless-stopped
+
+x-spark-base: &spark-base
+  <<: *restart-policy
+  build:
+    context: .
+    dockerfile: Dockerfile.spark
+  image: custom-spark:${SPARK_VERSION:-3.5.0}-py312
+  user: root
+  environment: &spark-env
+    SPARK_NO_DAEMONIZE: "true"
+    PYSPARK_PYTHON: python3
+    PYSPARK_DRIVER_PYTHON: python3
+  dns:
+    - 8.8.8.8
+  networks:
+    - data-platform-net
+
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: Dockerfile.airflow
+  image: custom-airflow:${AIRFLOW_VERSION:-3.1.2}
+  env_file:
+    - .env
+  dns:
+    - 8.8.8.8
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_PG_USER:-airflow}:${AIRFLOW_PG_PASSWORD:-airflow}@postgres:5432/${AIRFLOW_PG_DB:-airflow}
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://${AIRFLOW_PG_USER:-airflow}:${AIRFLOW_PG_PASSWORD:-airflow}@postgres:5432/${AIRFLOW_PG_DB:-airflow}
+    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW__API_AUTH__JWT_SECRET}
+    AIRFLOW__API_AUTH__JWT_ISSUER: ${AIRFLOW__API_AUTH__JWT_ISSUER}
+    JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: UTC
+    AIRFLOW__CELERY__WORKER_CONCURRENCY: 2
+    AIRFLOW_CONFIG: '/opt/airflow/config/airflow.cfg'
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./config:/opt/airflow/config
+    - ./plugins:/opt/airflow/plugins
+    - ./scripts:/opt/airflow/scripts
+    - ./data:/opt/airflow/scripts/data
+    - ./notebooks:/opt/airflow/notebooks
+    - spark_ivy_cache:/home/airflow/.ivy2
+  user: "${AIRFLOW_UID:-50000}:0"
+  networks:
+    - data-platform-net
+  depends_on: &airflow-depends-on
+    redis:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+
+# ================================================================
+services:
+
+  # ██ POSTGRESQL (Warehouse + Metadata) ██
+  postgres:
+    <<: *restart-policy
+    image: postgres:${POSTGRES_VERSION:-16}
+    container_name: postgres
+    hostname: postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${PG_USER:-postgres}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-postgres}
+      POSTGRES_DB: ${PG_DB:-postgres}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./config/pg-init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: [ "CMD", "pg_isready", "-U", "${PG_USER:-postgres}" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks:
+      - data-platform-net
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  pgadmin:
+    <<: *restart-policy
+    image: dpage/pgadmin4:${PGADMIN_VERSION:-8.4}
+    container_name: pgadmin
+    ports:
+      - "5050:80"
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@smartcity.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+      - ./config/pgadmin-servers.json:/pgadmin4/servers.json:ro
+    networks:
+      - data-platform-net
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # ██ MINIO (Data Lake) ██
+  minio:
+    <<: *restart-policy
+    image: minio/minio:latest
+    container_name: minio
+    hostname: minio
+    ports:
+      - "9005:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    networks:
+      - data-platform-net
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9000/minio/health/live" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ██ REDIS (Airflow Broker) ██
+  redis:
+    <<: *restart-policy
+    image: redis:${REDIS_VERSION:-7.2-bookworm}
+    container_name: redis
+    hostname: redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks:
+      - data-platform-net
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  # ██ KAFKA LAYER ██
+
+
+  kafka1:
+    image: confluentinc/cp-kafka:8.0.0
+    hostname: kafka1
+    container_name: kafka1
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+      - "9999:9999"
+    environment:
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka1:9099"
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:19092,EXTERNAL://0.0.0.0:9092,DOCKER://0.0.0.0:29092,CONTROLLER://0.0.0.0:9099
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka1:19092,EXTERNAL://${DOCKER_HOST_IP:-127.0.0.1}:9092,DOCKER://host.docker.internal:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,DOCKER:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_LOG4J_LOGGERS: "kafka.controller=INFO,kafka.producer.async.DefaultEventHandler=INFO,state.change.logger=INFO"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTHORIZER_CLASS_NAME: org.apache.kafka.metadata.authorizer.StandardAuthorizer
+      KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND: "true"
+    networks:
+      - data-platform-net
+
+  postgresql_conduktor:
+    extends:
+      file: conduktor.yml
+      service: postgresql
+
+  conduktor-console:
+    extends:
+      file: conduktor.yml
+      service: conduktor-console
+
+  # ██ SPARK LAYER ██
+  spark-master:
+    <<: *spark-base
+    container_name: spark-master
+    hostname: spark-master
+    command: >
+      /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master --host spark-master --port 7077 --webui-port 8080
+    ports:
+      - "8085:8080"
+      - "7077:7077"
+    environment:
+      <<: *spark-env
+      SPARK_DAEMON_MEMORY: ${SPARK_MASTER_DAEMON_MEM:-384m}
+    volumes:
+      - spark_logs:/opt/spark/logs
+      - spark_ivy_cache:/root/.ivy2
+      - ./config/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8080/" ]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  spark-worker:
+    <<: *spark-base
+    container_name: spark-worker
+    hostname: spark-worker
+    command: >
+      /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077 --webui-port 8081 --cores ${SPARK_WORKER_CORES:-2} --memory ${SPARK_WORKER_MEM:-4096m}
+    ports:
+      - "8081:8081"
+    environment:
+      <<: *spark-env
+    volumes:
+      - spark_logs:/opt/spark/logs
+      - spark_checkpoints:/opt/spark/checkpoints
+      - spark_ivy_cache:/root/.ivy2
+      - ./config/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+      - ./data:/data
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8081/" ]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 4096M
+
+  spark-notebook:
+    <<: *restart-policy
+    build:
+      context: .
+      dockerfile: Dockerfile.notebook
+    container_name: spark-notebook
+    hostname: spark-notebook
+    ports:
+
+      - "8889:8888"
+      - "4042:4040"
+    environment:
+      SPARK_MASTER: spark://spark-master:7077
+      PYSPARK_PYTHON: "python3"
+      PYSPARK_DRIVER_PYTHON: "python3"
+      JUPYTER_TOKEN: "admin"
+    volumes:
+      - ./notebooks:/home/jovyan/work
+      - ./config/spark-defaults.conf:/usr/local/spark/conf/spark-defaults.conf
+      - ./data:/data
+      - ./scripts:/home/jovyan/scripts
+      - ./data:/home/jovyan/scripts/data
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8888/api" ]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - data-platform-net
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
+
+  nessie:
+    <<: *restart-policy
+    image: projectnessie/nessie:latest
+    container_name: nessie
+    ports:
+      - "19120:19120"
+    environment:
+      - QUARKUS_HTTP_PORT=19120
+    networks:
+      - data-platform-net
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:19120/api/v1/config" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  dremio:
+    <<: *restart-policy
+    image: dremio/dremio-oss:latest
+    container_name: dremio
+    ports:
+      - "9047:9047"
+      - "31010:31010"
+      - "32010:32010"
+      - "45678:45678"
+    environment:
+      - DREMIO_MAX_MEMORY_SIZE_MB=4096
+    volumes:
+      - dremio_data:/opt/dremio/data
+    networks:
+      - data-platform-net
+    deploy:
+      resources:
+        limits:
+          memory: 4096M
+
+  # ██ AIRFLOW LAYER ██
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        mkdir -v -p /opt/airflow/{logs,dags,plugins,config} /home/airflow/.ivy2
+        chown -R "$${AIRFLOW_UID}:0" /opt/airflow/ /home/airflow/.ivy2
+        su -s /bin/bash airflow -c "airflow db migrate"
+        su -s /bin/bash airflow -c "airflow users create -u admin -p admin -r Admin -f Admin -l User -e admin@smartcity.local || true"
+        su -s /bin/bash airflow -c "airflow connections delete spark_default || true"
+        su -s /bin/bash airflow -c "airflow connections add 'spark_default' --conn-type 'spark' --conn-host 'spark://spark-master' --conn-port '7077'"
+        echo "✅ Airflow init complete"
+    environment:
+
+      <<: *airflow-env
+    user: "0:0"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./config:/opt/airflow/config
+      - ./scripts:/opt/airflow/scripts
+      - spark_ivy_cache:/home/airflow/.ivy2
+
+  airflow-apiserver:
+    <<: *airflow-common
+    container_name: airflow-apiserver
+    command: api-server
+    ports:
+      - "8090:8080"
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8080/api/v2/monitor/health" ]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    depends_on:
+      <<: *airflow-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8974/health" ]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    depends_on:
+      <<: *airflow-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          memory: 2048M
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: airflow-dag-processor
+    command: dag-processor
+    depends_on:
+      <<: *airflow-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
+
+  airflow-worker:
+    <<: *airflow-common
+    container_name: airflow-worker
+    command: celery worker
+    environment:
+      <<: *airflow-env
+      DUMB_INIT_SETSID: "0"
+    depends_on:
+      <<: *airflow-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          memory: 2048M
+
+  airflow-triggerer:
+    <<: *airflow-common
+    container_name: airflow-triggerer
+    command: triggerer
+    depends_on:
+      <<: *airflow-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
+
+  # ██ OBSERVABILITY LAYER ██
+
+  prometheus:
+    <<: *restart-policy
+    image: prom/prometheus:v2.51.2
+    container_name: prometheus
+    hostname: prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=7d'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      - data-platform-net
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  node-exporter:
+    <<: *restart-policy
+    image: prom/node-exporter:v1.8.0
+    container_name: node-exporter
+    hostname: node-exporter
+    ports:
+      - "9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.rootfs=/rootfs'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    networks:
+      - data-platform-net
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  cadvisor:
+    <<: *restart-policy
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: cadvisor
+    hostname: cadvisor
+    ports:
+      - "8087:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /sys:/sys:ro
+      - /proc:/proc:ro
+      - /var/lib/docker:/var/lib/docker:ro
+    privileged: true
+    devices:
+      - /dev/kmsg
+    networks:
+      - data-platform-net
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  grafana:
+    <<: *restart-policy
+    image: grafana/grafana:10.4.2
+    container_name: grafana
+    hostname: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-smartcity2025}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_DOMAIN: localhost
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/smart_city_dashboard.json
+      DREMIO_USER: ${DREMIO_USER:-admin}
+      DREMIO_PASSWORD: ${DREMIO_PASSWORD:-}
+      DREMIO_PAT: ${DREMIO_PAT:-}
+      # ── SMTP Email Alerting ──
+      GF_SMTP_ENABLED: "true"
+      GF_SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com:587}
+      GF_SMTP_USER: ${SMTP_USER:-}
+      GF_SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      GF_SMTP_FROM_ADDRESS: ${SMTP_FROM_ADDRESS:-admin@smartcity.com}
+      GF_SMTP_FROM_NAME: "Smart City Alert System"
+      GF_SMTP_STARTTLS_POLICY: "MandatoryStartTLS"
+
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./config/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+      - postgres
+    networks:
+      - data-platform-net
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -f http://localhost:3000/api/health || exit 1" ]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+# ================================================================
+# Named Volumes
+# ================================================================
+volumes:
+  spark_logs:
+  spark_checkpoints:
+  postgres_data:
+  pgadmin_data:
+  minio_data:
+  spark_ivy_cache:
+  dremio_data:
+  pg_data:
+  conduktor_data:
+  prometheus_data:
+  grafana_data:
+

@@ -1,0 +1,36 @@
+# Exclude Airflow logs and state
+logs/
+airflow.db
+airflow.cfg
+webserver_config.py
+
+# Exclude local data outputs
+data_sources/outputs/
+
+# Exclude environment files
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Python virtual environments
+venv/
+.venv/
+env/
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# IDEs and Editors
+.vscode/
+.idea/
+
+# Grafana & Prometheus persistent data (managed by Docker volumes)
+grafana_data/
+prometheus_data/
